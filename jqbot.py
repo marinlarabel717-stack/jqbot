@@ -37,6 +37,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", "0")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
 
+# 文件上传限制
+MAX_ZIP_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+
 DB_PATH = "jqbot.db"
 SESSIONS_DIR = "sessions"
 LOGS_DIR = "logs"
@@ -857,13 +860,13 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
                         with zipfile.ZipFile(temp_path, "r") as zip_ref:
                             # 验证 zip 内容安全性
                             for member in zip_ref.namelist():
-                                # 检查路径遍历
+                                # Check for path traversal
                                 if member.startswith('/') or '..' in member:
-                                    raise ValueError("不安全的 zip 文件路径")
-                                # 检查文件大小（防止 zip bomb）
+                                    raise ValueError("Unsafe zip file path")
+                                # Check file size (prevent zip bomb)
                                 info = zip_ref.getinfo(member)
-                                if info.file_size > 100 * 1024 * 1024:  # 100MB 限制
-                                    raise ValueError("zip 文件内容过大")
+                                if info.file_size > MAX_ZIP_FILE_SIZE:
+                                    raise ValueError("Zip file content too large")
                             
                             zip_ref.extractall(extract_dir)
                     except (zipfile.BadZipFile, ValueError) as e:
@@ -889,11 +892,11 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
                 os.remove(temp_path)
     
     elif update.message.text:
-        # 处理 session string
+        # Handle session string
         session_string = update.message.text.strip()
         
-        # 增强验证：检查 session string 格式
-        # Telethon session strings 通常是 base64 编码且长度 > 200
+        # Enhanced validation: Check session string format
+        # Telethon session strings are typically base64 encoded and length > 200
         if len(session_string) > 200 and re.match(r'^[A-Za-z0-9+/=]+$', session_string):
             try:
                 # 尝试连接验证

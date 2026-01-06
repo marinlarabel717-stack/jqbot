@@ -34,7 +34,7 @@ import aiosqlite
 
 # ============== 配置 ==============
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", "0"))
+API_ID = int(os.getenv("API_ID", "0")) if os.getenv("API_ID") else 0
 API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
 
 DB_PATH = "jqbot.db"
@@ -237,17 +237,21 @@ async def get_settings(user_id: int) -> Dict:
 
 async def update_settings(user_id: int, **kwargs):
     """更新设置"""
+    # 允许的设置字段白名单
+    allowed_fields = {"interval_min", "interval_max", "daily_limit"}
+    
     async with aiosqlite.connect(DB_PATH) as db:
         # 先尝试插入
         await db.execute(
             "INSERT OR IGNORE INTO settings (user_id) VALUES (?)", (user_id,)
         )
         
-        # 更新字段
+        # 更新字段（使用白名单验证）
         for key, value in kwargs.items():
-            await db.execute(
-                f"UPDATE settings SET {key} = ? WHERE user_id = ?", (value, user_id)
-            )
+            if key in allowed_fields:
+                await db.execute(
+                    f"UPDATE settings SET {key} = ? WHERE user_id = ?", (value, user_id)
+                )
         
         await db.commit()
 
@@ -837,33 +841,40 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
         file = await update.message.document.get_file()
         file_name = update.message.document.file_name
         
-        # 下载到临时目录
-        temp_path = f"/tmp/{file_name}"
-        await file.download_to_drive(temp_path)
+        # 使用安全的临时文件
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix=os.path.splitext(file_name)[1]) as tmp_file:
+            temp_path = tmp_file.name
         
-        if file_name.endswith(".zip"):
-            # 解压 zip
-            with zipfile.ZipFile(temp_path, "r") as zip_ref:
-                zip_ref.extractall("/tmp/sessions")
+        try:
+            await file.download_to_drive(temp_path)
             
-            await update.message.reply_text(
-                "⚠️ ZIP 文件支持有限，请提供 session string",
-                reply_markup=get_accounts_menu_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                "⚠️ 请直接发送 session string (文本格式)",
-                reply_markup=get_accounts_menu_keyboard()
-            )
-        
-        os.remove(temp_path)
+            if file_name.endswith(".zip"):
+                # 解压 zip
+                with tempfile.TemporaryDirectory() as extract_dir:
+                    with zipfile.ZipFile(temp_path, "r") as zip_ref:
+                        zip_ref.extractall(extract_dir)
+                
+                await update.message.reply_text(
+                    "⚠️ ZIP 文件支持有限，请提供 session string",
+                    reply_markup=get_accounts_menu_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ 请直接发送 session string (文本格式)",
+                    reply_markup=get_accounts_menu_keyboard()
+                )
+        finally:
+            # 确保清理临时文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
     
     elif update.message.text:
         # 处理 session string
         session_string = update.message.text.strip()
         
-        # 简单验证（实际应该更严格）
-        if len(session_string) > 50:
+        # 增强验证：检查 session string 格式
+        # Telethon session strings 通常是 base64 编码且长度 > 200
+        if len(session_string) > 200 and re.match(r'^[A-Za-z0-9+/=]+$', session_string):
             try:
                 # 尝试连接验证
                 is_valid, phone = await check_account_status(session_string)
@@ -880,13 +891,14 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
                         reply_markup=get_accounts_menu_keyboard()
                     )
             except Exception as e:
+                logger.error(f"添加账户异常: {e}")
                 await update.message.reply_text(
-                    f"❌ 添加失败: {e}",
+                    f"❌ 添加失败: 账户验证错误",
                     reply_markup=get_accounts_menu_keyboard()
                 )
         else:
             await update.message.reply_text(
-                "❌ Session string 格式不正确",
+                "❌ Session string 格式不正确（应为 base64 编码，长度 > 200）",
                 reply_markup=get_accounts_menu_keyboard()
             )
     
@@ -918,10 +930,14 @@ async def handle_upload_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if update.message.document:
         file = await update.message.document.get_file()
-        temp_path = f"/tmp/{update.message.document.file_name}"
-        await file.download_to_drive(temp_path)
+        
+        # 使用安全的临时文件
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.txt') as tmp_file:
+            temp_path = tmp_file.name
         
         try:
+            await file.download_to_drive(temp_path)
+            
             with open(temp_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             
@@ -936,13 +952,16 @@ async def handle_upload_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ 成功添加 {count} 个链接",
                 reply_markup=get_links_menu_keyboard()
             )
-            
-            os.remove(temp_path)
         except Exception as e:
+            logger.error(f"读取文件失败: {e}")
             await update.message.reply_text(
-                f"❌ 读取文件失败: {e}",
+                f"❌ 读取文件失败: 文件格式错误",
                 reply_markup=get_links_menu_keyboard()
             )
+        finally:
+            # 确保清理临时文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
     else:
         await update.message.reply_text(
             "❌ 请上传 TXT 文件",

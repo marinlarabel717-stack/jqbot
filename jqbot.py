@@ -263,18 +263,36 @@ async def update_settings(user_id: int, **kwargs):
 
 # ============== 账户管理 ==============
 
+def is_session_file_path(session_string: str) -> bool:
+    """判断是否是 session 文件路径"""
+    if not session_string:
+        return False
+    # 检查文件是否存在（带或不带 .session 后缀）
+    if session_string.endswith('.session'):
+        return os.path.exists(session_string)
+    return os.path.exists(f"{session_string}.session")
+
+
+def clean_phone_number(phone: str) -> str:
+    """清理手机号，移除格式字符"""
+    return phone.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
+
+
+def get_telegram_client(session_string: str) -> TelegramClient:
+    """根据 session 类型创建 TelegramClient"""
+    if is_session_file_path(session_string):
+        # 文件路径
+        session = session_string if not session_string.endswith('.session') else session_string.replace('.session', '')
+        return TelegramClient(session, API_ID, API_HASH)
+    else:
+        # StringSession
+        return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+
+
 async def check_account_status(session_string: str) -> Tuple[bool, str]:
     """检查账户状态 - 支持 StringSession 或文件路径"""
     try:
-        # 判断是 StringSession 还是文件路径
-        if os.path.exists(f"{session_string}.session") or os.path.exists(session_string):
-            # 文件路径
-            session = session_string if not session_string.endswith('.session') else session_string.replace('.session', '')
-            client = TelegramClient(session, API_ID, API_HASH)
-        else:
-            # StringSession
-            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        
+        client = get_telegram_client(session_string)
         await client.connect()
         
         if await client.is_user_authorized():
@@ -389,16 +407,8 @@ async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFA
                 break
             
             try:
-                # 判断是 StringSession 还是文件路径
-                session_str = account["session_string"]
-                if os.path.exists(f"{session_str}.session") or os.path.exists(session_str):
-                    # 文件路径
-                    session = session_str if not session_str.endswith('.session') else session_str.replace('.session', '')
-                    client = TelegramClient(session, API_ID, API_HASH)
-                else:
-                    # StringSession
-                    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-                
+                # 使用 helper 函数创建 client
+                client = get_telegram_client(account["session_string"])
                 await client.connect()
                 
                 if not await client.is_user_authorized():
@@ -914,9 +924,11 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
         # 处理手机号码 - 手动验证码登录
         phone = update.message.text.strip()
         
-        # 验证手机号格式 (支持 + 开头的国际号码，允许空格和连字符)
+        # 验证手机号格式
         phone_pattern = r'^\+?[0-9\s\-\(\)]+$'
-        if re.match(phone_pattern, phone) and len(phone.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')) >= 10:
+        cleaned_phone = clean_phone_number(phone)
+        
+        if re.match(phone_pattern, phone) and len(cleaned_phone) >= 10:
             try:
                 # 初始化手动登录流程
                 await update.message.reply_text(
@@ -986,8 +998,8 @@ async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str,
         if dest_path and os.path.exists(dest_path):
             try:
                 os.remove(dest_path)
-            except:
-                pass
+            except (OSError, FileNotFoundError) as cleanup_error:
+                logger.warning(f"清理文件失败: {cleanup_error}")
         return False, "Session 文件处理失败", ""
 
 
@@ -1046,9 +1058,9 @@ async def process_tdata_format(extract_dir: str, user_id: int) -> Tuple[bool, st
             if not os.path.isdir(item_path):
                 continue
             
-            # 检查是否是手机号格式 (数字、+、-、空格)
+            # 检查是否是手机号格式
             phone_candidate = item
-            cleaned = phone_candidate.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
+            cleaned = clean_phone_number(phone_candidate)
             if not cleaned.isdigit():
                 continue
             

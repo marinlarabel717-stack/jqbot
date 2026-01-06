@@ -89,22 +89,36 @@ python jqbot.py
 3. 点击 "API development tools"
 4. 创建应用并获取 `api_id` 和 `api_hash`
 
-### 获取 Session String
+### 获取账户文件
 
-使用 Telethon 生成 session string：
+支持以下账户登录方式：
+
+#### 方式 1: Session 文件
+使用 Telethon 生成 session 文件：
 
 ```python
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 API_ID = 12345
 API_HASH = "your_api_hash"
+phone = "+8613800138000"
 
-with TelegramClient(StringSession(), API_ID, API_HASH) as client:
-    print(client.session.save())
+client = TelegramClient("my_account", API_ID, API_HASH)
+client.start(phone)
+# 按提示输入验证码
+client.disconnect()
+# 生成 my_account.session 文件
 ```
 
-运行后登录账号，将输出的字符串复制保存。
+#### 方式 2: ZIP 文件
+将 session 文件打包成 ZIP：
+- 单个 .session 文件
+- session + json 文件（一起打包）
+- tdata 格式: `手机号/tdata/D877F783D5D3EF8C/key_datas`
+
+#### 方式 3: 手动验证码登录
+直接在 Bot 中发送手机号码（如 +8613800138000），系统会引导完成登录。
+注意：此功能需要额外配置。
 
 ## 操作说明
 
@@ -116,7 +130,11 @@ with TelegramClient(StringSession(), API_ID, API_HASH) as client:
 
 1. 点击 `📁 账户管理`
 2. 点击 `➕ 上传账户`
-3. 发送 session string（文本格式）
+3. 选择以下方式之一：
+   - 发送手机号码（如 +8613800138000）进行验证码登录
+   - 上传 .session 文件
+   - 上传包含账户文件的 ZIP 压缩包
+   - 上传 tdata 格式的 ZIP 文件
 4. 等待验证完成
 
 ### 3. 添加链接

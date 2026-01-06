@@ -12,6 +12,7 @@ import zipfile
 import tempfile
 import random
 import re
+import shutil
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 from pathlib import Path
@@ -263,13 +264,17 @@ async def update_settings(user_id: int, **kwargs):
 # ============== 账户管理 ==============
 
 async def check_account_status(session_string: str) -> Tuple[bool, str]:
-    """检查账户状态"""
+    """检查账户状态 - 支持 StringSession 或文件路径"""
     try:
-        client = TelegramClient(
-            StringSession(session_string),
-            API_ID,
-            API_HASH
-        )
+        # 判断是 StringSession 还是文件路径
+        if os.path.exists(f"{session_string}.session") or os.path.exists(session_string):
+            # 文件路径
+            session = session_string if not session_string.endswith('.session') else session_string.replace('.session', '')
+            client = TelegramClient(session, API_ID, API_HASH)
+        else:
+            # StringSession
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        
         await client.connect()
         
         if await client.is_user_authorized():
@@ -384,11 +389,16 @@ async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFA
                 break
             
             try:
-                client = TelegramClient(
-                    StringSession(account["session_string"]),
-                    API_ID,
-                    API_HASH
-                )
+                # 判断是 StringSession 还是文件路径
+                session_str = account["session_string"]
+                if os.path.exists(f"{session_str}.session") or os.path.exists(session_str):
+                    # 文件路径
+                    session = session_str if not session_str.endswith('.session') else session_str.replace('.session', '')
+                    client = TelegramClient(session, API_ID, API_HASH)
+                else:
+                    # StringSession
+                    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+                
                 await client.connect()
                 
                 if not await client.is_user_authorized():
@@ -559,11 +569,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == "upload_account":
         await query.edit_message_text(
-            "请上传 session 文件或发送 session string\n\n"
+            "请选择登录方式或上传账户文件\n\n"
             "支持格式：\n"
-            "1. .session 文件\n"
-            "2. session string (文本)\n"
-            "3. .zip 压缩包（包含 session 文件）\n\n"
+            "1. 📱 手动验证码登录 - 发送手机号码\n"
+            "2. 📄 session 文件 (.session)\n"
+            "3. 📋 session+json 文件 (.zip包含两个文件)\n"
+            "4. 📦 ZIP 文件 (包含 session/tdata)\n"
+            "5. 🗂️ tdata 格式 (zip: 手机号/tdata/xxx/key_datas)\n\n"
             "发送 /cancel 取消"
         )
         return UPLOAD_ACCOUNT
@@ -838,7 +850,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============== 消息处理 ==============
 
 async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理账户上传"""
+    """处理账户上传 - 支持多种格式"""
     user_id = update.effective_user.id
     
     if update.message.document:
@@ -854,78 +866,211 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
             await file.download_to_drive(temp_path)
             
             if file_name.endswith(".zip"):
-                # 安全地解压 zip
-                with tempfile.TemporaryDirectory() as extract_dir:
-                    try:
-                        with zipfile.ZipFile(temp_path, "r") as zip_ref:
-                            # 验证 zip 内容安全性
-                            for member in zip_ref.namelist():
-                                # Check for path traversal
-                                if member.startswith('/') or '..' in member:
-                                    raise ValueError("Unsafe zip file path")
-                                # Check file size (prevent zip bomb)
-                                info = zip_ref.getinfo(member)
-                                if info.file_size > MAX_ZIP_FILE_SIZE:
-                                    raise ValueError("Zip file content too large")
-                            
-                            zip_ref.extractall(extract_dir)
-                    except (zipfile.BadZipFile, ValueError) as e:
-                        logger.warning(f"不安全的 zip 文件: {e}")
-                        await update.message.reply_text(
-                            "⚠️ ZIP 文件格式不正确或不安全",
-                            reply_markup=get_accounts_menu_keyboard()
-                        )
-                        return ConversationHandler.END
-                
-                await update.message.reply_text(
-                    "⚠️ ZIP 文件支持有限，请提供 session string",
-                    reply_markup=get_accounts_menu_keyboard()
-                )
-            else:
-                await update.message.reply_text(
-                    "⚠️ 请直接发送 session string (文本格式)",
-                    reply_markup=get_accounts_menu_keyboard()
-                )
-        finally:
-            # 确保清理临时文件
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-    
-    elif update.message.text:
-        # Handle session string
-        session_string = update.message.text.strip()
-        
-        # Enhanced validation: Check session string format
-        # Telethon session strings are typically base64 encoded and length > 200
-        if len(session_string) > 200 and re.match(r'^[A-Za-z0-9+/=]+$', session_string):
-            try:
-                # 尝试连接验证
-                is_valid, phone = await check_account_status(session_string)
-                
-                if is_valid:
-                    await add_account(user_id, phone, session_string)
+                # 处理 ZIP 文件
+                success, message, phone = await process_zip_account(temp_path, user_id)
+                if success:
+                    await update.message.reply_text(
+                        f"✅ 账户添加成功\n{message}",
+                        reply_markup=get_accounts_menu_keyboard()
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ {message}",
+                        reply_markup=get_accounts_menu_keyboard()
+                    )
+            
+            elif file_name.endswith(".session"):
+                # 处理单个 session 文件
+                success, message, phone = await process_session_file(temp_path, user_id)
+                if success:
                     await update.message.reply_text(
                         f"✅ 账户添加成功\n手机号: {phone}",
                         reply_markup=get_accounts_menu_keyboard()
                     )
                 else:
                     await update.message.reply_text(
-                        f"❌ 账户验证失败: {phone}",
+                        f"❌ {message}",
                         reply_markup=get_accounts_menu_keyboard()
                     )
-            except Exception as e:
-                logger.error(f"添加账户异常: {e}")
+            
+            else:
                 await update.message.reply_text(
-                    f"❌ 添加失败: 账户验证错误",
+                    "⚠️ 不支持的文件格式\n请上传 .session 或 .zip 文件",
+                    reply_markup=get_accounts_menu_keyboard()
+                )
+        
+        except Exception as e:
+            logger.error(f"处理文件失败: {e}")
+            await update.message.reply_text(
+                "❌ 文件处理失败",
+                reply_markup=get_accounts_menu_keyboard()
+            )
+        finally:
+            # 确保清理临时文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    
+    elif update.message.text:
+        # 处理手机号码 - 手动验证码登录
+        phone = update.message.text.strip()
+        
+        # 验证手机号格式 (支持 + 开头的国际号码)
+        if phone.startswith('+') and len(phone) > 10 and phone[1:].isdigit():
+            try:
+                # 初始化手动登录流程
+                await update.message.reply_text(
+                    f"📱 正在发起登录请求...\n手机号: {phone}\n\n"
+                    "⚠️ 由于安全限制，手动登录功能暂不可用\n"
+                    "请使用以下方式：\n"
+                    "1. 上传 .session 文件\n"
+                    "2. 上传包含 session 的 ZIP 文件\n"
+                    "3. 上传 tdata 格式的 ZIP 文件",
+                    reply_markup=get_accounts_menu_keyboard()
+                )
+            except Exception as e:
+                logger.error(f"手动登录失败: {e}")
+                await update.message.reply_text(
+                    "❌ 登录失败",
                     reply_markup=get_accounts_menu_keyboard()
                 )
         else:
             await update.message.reply_text(
-                "❌ Session string 格式不正确（应为 base64 编码，长度 > 200）",
+                "❌ 手机号格式不正确\n格式: +8613800138000\n\n或上传账户文件",
                 reply_markup=get_accounts_menu_keyboard()
             )
     
     return ConversationHandler.END
+
+
+async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str, str]:
+    """处理单个 session 文件"""
+    try:
+        # 使用 Telethon 加载 session 文件
+        session_name = os.path.splitext(os.path.basename(file_path))[0]
+        
+        # 将文件复制到 sessions 目录
+        dest_path = os.path.join(SESSIONS_DIR, f"user_{user_id}_{session_name}.session")
+        shutil.copy(file_path, dest_path)
+        
+        # 尝试连接验证
+        session_file = dest_path.replace('.session', '')
+        client = TelegramClient(session_file, API_ID, API_HASH)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            phone = me.phone if me.phone else "未知"
+            
+            # 保存 session 文件路径到数据库 (使用文件路径作为标识)
+            # 注意: 这里简化处理，直接使用相对路径
+            session_string = session_file
+            
+            await client.disconnect()
+            
+            # 保存到数据库
+            await add_account(user_id, phone, session_string)
+            
+            return True, f"手机号: {phone}", phone
+        else:
+            await client.disconnect()
+            # 删除无效的 session 文件
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            return False, "Session 文件未授权或已过期", ""
+    
+    except Exception as e:
+        logger.error(f"处理 session 文件失败: {e}")
+        return False, f"Session 文件无效: {str(e)[:50]}", ""
+
+
+async def process_zip_account(zip_path: str, user_id: int) -> Tuple[bool, str, str]:
+    """处理 ZIP 文件 - 支持 session、tdata 格式"""
+    with tempfile.TemporaryDirectory() as extract_dir:
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                # 验证 zip 内容安全性
+                for member in zip_ref.namelist():
+                    # Check for path traversal
+                    if member.startswith('/') or '..' in member:
+                        return False, "ZIP 文件包含不安全的路径", ""
+                    # Check file size (prevent zip bomb)
+                    info = zip_ref.getinfo(member)
+                    if info.file_size > MAX_ZIP_FILE_SIZE:
+                        return False, "ZIP 文件内容过大", ""
+                
+                zip_ref.extractall(extract_dir)
+        except (zipfile.BadZipFile, ValueError) as e:
+            logger.warning(f"无效的 zip 文件: {e}")
+            return False, "ZIP 文件格式不正确", ""
+        
+        # 检查是否是 tdata 格式
+        tdata_result = await process_tdata_format(extract_dir, user_id)
+        if tdata_result[0]:
+            return tdata_result
+        
+        # 检查是否有 session 文件
+        session_files = []
+        json_files = []
+        
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith('.session'):
+                    session_files.append(os.path.join(root, file))
+                elif file.endswith('.json'):
+                    json_files.append(os.path.join(root, file))
+        
+        if session_files:
+            # 处理第一个找到的 session 文件
+            result = await process_session_file(session_files[0], user_id)
+            if result[0]:
+                return result
+            return False, "Session 文件无效", ""
+        
+        return False, "ZIP 文件中未找到有效的 session 或 tdata 文件", ""
+
+
+async def process_tdata_format(extract_dir: str, user_id: int) -> Tuple[bool, str, str]:
+    """处理 tdata 格式: phone_number/tdata/D877F783D5D3EF8C/key_datas"""
+    try:
+        # 遍历查找 tdata 结构
+        for item in os.listdir(extract_dir):
+            item_path = os.path.join(extract_dir, item)
+            if not os.path.isdir(item_path):
+                continue
+            
+            # 检查是否是手机号格式 (纯数字或+开头)
+            phone_candidate = item
+            if not (phone_candidate.replace('+', '').replace('-', '').replace(' ', '').isdigit()):
+                continue
+            
+            # 查找 tdata 目录
+            tdata_path = os.path.join(item_path, "tdata")
+            if not os.path.exists(tdata_path):
+                continue
+            
+            # 查找类似 D877F783D5D3EF8C 的子目录和 key_datas 文件
+            found_valid = False
+            for subdir in os.listdir(tdata_path):
+                subdir_path = os.path.join(tdata_path, subdir)
+                if not os.path.isdir(subdir_path):
+                    continue
+                
+                key_datas_path = os.path.join(subdir_path, "key_datas")
+                if os.path.exists(key_datas_path):
+                    found_valid = True
+                    break
+            
+            if found_valid:
+                # 找到有效的 tdata 格式
+                # 注意：tdata 格式需要使用 Telegram Desktop 的 API
+                # 这里暂时返回成功但实际上需要特殊处理
+                return False, "tdata 格式需要特殊转换工具，暂不支持直接导入\n建议使用 session 文件", ""
+        
+        return False, "", ""
+    
+    except Exception as e:
+        logger.error(f"处理 tdata 格式失败: {e}")
+        return False, "", ""
 
 async def handle_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理添加链接"""

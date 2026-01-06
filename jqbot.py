@@ -237,8 +237,12 @@ async def get_settings(user_id: int) -> Dict:
 
 async def update_settings(user_id: int, **kwargs):
     """更新设置"""
-    # 允许的设置字段白名单
-    allowed_fields = {"interval_min", "interval_max", "daily_limit"}
+    # 允许的设置字段白名单及其对应的 SQL 查询
+    allowed_queries = {
+        "interval_min": "UPDATE settings SET interval_min = ? WHERE user_id = ?",
+        "interval_max": "UPDATE settings SET interval_max = ? WHERE user_id = ?",
+        "daily_limit": "UPDATE settings SET daily_limit = ? WHERE user_id = ?",
+    }
     
     async with aiosqlite.connect(DB_PATH) as db:
         # 先尝试插入
@@ -246,12 +250,10 @@ async def update_settings(user_id: int, **kwargs):
             "INSERT OR IGNORE INTO settings (user_id) VALUES (?)", (user_id,)
         )
         
-        # 更新字段（使用白名单验证）
+        # 更新字段（使用预定义的查询）
         for key, value in kwargs.items():
-            if key in allowed_fields:
-                await db.execute(
-                    f"UPDATE settings SET {key} = ? WHERE user_id = ?", (value, user_id)
-                )
+            if key in allowed_queries:
+                await db.execute(allowed_queries[key], (value, user_id))
         
         await db.commit()
 
@@ -849,10 +851,28 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
             await file.download_to_drive(temp_path)
             
             if file_name.endswith(".zip"):
-                # 解压 zip
+                # 安全地解压 zip
                 with tempfile.TemporaryDirectory() as extract_dir:
-                    with zipfile.ZipFile(temp_path, "r") as zip_ref:
-                        zip_ref.extractall(extract_dir)
+                    try:
+                        with zipfile.ZipFile(temp_path, "r") as zip_ref:
+                            # 验证 zip 内容安全性
+                            for member in zip_ref.namelist():
+                                # 检查路径遍历
+                                if member.startswith('/') or '..' in member:
+                                    raise ValueError("不安全的 zip 文件路径")
+                                # 检查文件大小（防止 zip bomb）
+                                info = zip_ref.getinfo(member)
+                                if info.file_size > 100 * 1024 * 1024:  # 100MB 限制
+                                    raise ValueError("zip 文件内容过大")
+                            
+                            zip_ref.extractall(extract_dir)
+                    except (zipfile.BadZipFile, ValueError) as e:
+                        logger.warning(f"不安全的 zip 文件: {e}")
+                        await update.message.reply_text(
+                            "⚠️ ZIP 文件格式不正确或不安全",
+                            reply_markup=get_accounts_menu_keyboard()
+                        )
+                        return ConversationHandler.END
                 
                 await update.message.reply_text(
                     "⚠️ ZIP 文件支持有限，请提供 session string",

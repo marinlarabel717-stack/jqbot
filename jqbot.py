@@ -914,8 +914,9 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
         # 处理手机号码 - 手动验证码登录
         phone = update.message.text.strip()
         
-        # 验证手机号格式 (支持 + 开头的国际号码)
-        if phone.startswith('+') and len(phone) > 10 and phone[1:].isdigit():
+        # 验证手机号格式 (支持 + 开头的国际号码，允许空格和连字符)
+        phone_pattern = r'^\+?[0-9\s\-\(\)]+$'
+        if re.match(phone_pattern, phone) and len(phone.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')) >= 10:
             try:
                 # 初始化手动登录流程
                 await update.message.reply_text(
@@ -944,6 +945,7 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str, str]:
     """处理单个 session 文件"""
+    dest_path = None
     try:
         # 使用 Telethon 加载 session 文件
         session_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -974,13 +976,19 @@ async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str,
         else:
             await client.disconnect()
             # 删除无效的 session 文件
-            if os.path.exists(dest_path):
+            if dest_path and os.path.exists(dest_path):
                 os.remove(dest_path)
             return False, "Session 文件未授权或已过期", ""
     
     except Exception as e:
         logger.error(f"处理 session 文件失败: {e}")
-        return False, f"Session 文件无效: {str(e)[:50]}", ""
+        # 清理失败的文件
+        if dest_path and os.path.exists(dest_path):
+            try:
+                os.remove(dest_path)
+            except:
+                pass
+        return False, "Session 文件处理失败", ""
 
 
 async def process_zip_account(zip_path: str, user_id: int) -> Tuple[bool, str, str]:
@@ -1038,9 +1046,10 @@ async def process_tdata_format(extract_dir: str, user_id: int) -> Tuple[bool, st
             if not os.path.isdir(item_path):
                 continue
             
-            # 检查是否是手机号格式 (纯数字或+开头)
+            # 检查是否是手机号格式 (数字、+、-、空格)
             phone_candidate = item
-            if not (phone_candidate.replace('+', '').replace('-', '').replace(' ', '').isdigit()):
+            cleaned = phone_candidate.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
+            if not cleaned.isdigit():
                 continue
             
             # 查找 tdata 目录
@@ -1062,9 +1071,9 @@ async def process_tdata_format(extract_dir: str, user_id: int) -> Tuple[bool, st
             
             if found_valid:
                 # 找到有效的 tdata 格式
-                # 注意：tdata 格式需要使用 Telegram Desktop 的 API
-                # 这里暂时返回成功但实际上需要特殊处理
-                return False, "tdata 格式需要特殊转换工具，暂不支持直接导入\n建议使用 session 文件", ""
+                # 注意：tdata 格式需要使用 Telegram Desktop 的 API 或专门的转换工具
+                logger.info(f"发现 tdata 格式，手机号: {phone_candidate}")
+                return False, f"检测到 tdata 格式 (手机号: {phone_candidate})\n该格式需要特殊转换工具\n建议使用 session 文件替代", phone_candidate
         
         return False, "", ""
     

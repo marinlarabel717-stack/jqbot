@@ -122,8 +122,8 @@ def parse_proxy_line(line: str) -> Optional[Dict]:
                 if ':' in rest:
                     host, port = rest.rsplit(':', 1)
         
-        # 2. username:password@host:port 格式
-        elif '@' in line and line.count(':') >= 3:
+        # 2. username:password@host:port 格式 (必须在 ABC 格式之前检查)
+        elif '@' in line:
             auth, addr = line.rsplit('@', 1)
             if ':' in auth:
                 username, password = auth.split(':', 1)

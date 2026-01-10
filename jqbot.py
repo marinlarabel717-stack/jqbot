@@ -69,7 +69,10 @@ logger = logging.getLogger(__name__)
     UPLOAD_TXT,
     SET_INTERVAL,
     SET_LIMIT,
-) = range(5)
+    SET_SLEEP,
+    SET_MAX_PER_ACCOUNT,
+    SET_ANTI_FLOOD,
+) = range(8)
 
 # 任务状态
 task_running = {}
@@ -293,7 +296,11 @@ async def init_db():
                 phone TEXT,
                 session_string TEXT,
                 status TEXT DEFAULT 'offline',
-                added_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                today_joined INTEGER DEFAULT 0,
+                total_joined INTEGER DEFAULT 0,
+                last_join_time DATETIME,
+                sleep_until DATETIME
             )
         """)
         
@@ -303,7 +310,10 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 link TEXT NOT NULL,
-                added_date DATETIME DEFAULT CURRENT_TIMESTAMP
+                added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                fail_reason TEXT,
+                joined_by INTEGER
             )
         """)
         
@@ -324,11 +334,59 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 user_id INTEGER PRIMARY KEY,
-                interval_min INTEGER DEFAULT 30,
-                interval_max INTEGER DEFAULT 60,
-                daily_limit INTEGER DEFAULT 50
+                interval_min INTEGER DEFAULT 120,
+                interval_max INTEGER DEFAULT 180,
+                daily_limit INTEGER DEFAULT 50,
+                allow_repeat INTEGER DEFAULT 0,
+                sleep_after_count INTEGER DEFAULT 10,
+                sleep_duration INTEGER DEFAULT 30,
+                max_per_account INTEGER DEFAULT 20,
+                anti_flood_extra INTEGER DEFAULT 30
             )
         """)
+        
+        # Migration: Add new columns to existing tables if they don't exist
+        # Check and add columns to accounts table
+        cursor = await db.execute("PRAGMA table_info(accounts)")
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        
+        if 'today_joined' not in column_names:
+            await db.execute("ALTER TABLE accounts ADD COLUMN today_joined INTEGER DEFAULT 0")
+        if 'total_joined' not in column_names:
+            await db.execute("ALTER TABLE accounts ADD COLUMN total_joined INTEGER DEFAULT 0")
+        if 'last_join_time' not in column_names:
+            await db.execute("ALTER TABLE accounts ADD COLUMN last_join_time DATETIME")
+        if 'sleep_until' not in column_names:
+            await db.execute("ALTER TABLE accounts ADD COLUMN sleep_until DATETIME")
+        
+        # Check and add columns to links table
+        cursor = await db.execute("PRAGMA table_info(links)")
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        
+        if 'status' not in column_names:
+            await db.execute("ALTER TABLE links ADD COLUMN status TEXT DEFAULT 'pending'")
+        if 'fail_reason' not in column_names:
+            await db.execute("ALTER TABLE links ADD COLUMN fail_reason TEXT")
+        if 'joined_by' not in column_names:
+            await db.execute("ALTER TABLE links ADD COLUMN joined_by INTEGER")
+        
+        # Check and add columns to settings table
+        cursor = await db.execute("PRAGMA table_info(settings)")
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        
+        if 'allow_repeat' not in column_names:
+            await db.execute("ALTER TABLE settings ADD COLUMN allow_repeat INTEGER DEFAULT 0")
+        if 'sleep_after_count' not in column_names:
+            await db.execute("ALTER TABLE settings ADD COLUMN sleep_after_count INTEGER DEFAULT 10")
+        if 'sleep_duration' not in column_names:
+            await db.execute("ALTER TABLE settings ADD COLUMN sleep_duration INTEGER DEFAULT 30")
+        if 'max_per_account' not in column_names:
+            await db.execute("ALTER TABLE settings ADD COLUMN max_per_account INTEGER DEFAULT 20")
+        if 'anti_flood_extra' not in column_names:
+            await db.execute("ALTER TABLE settings ADD COLUMN anti_flood_extra INTEGER DEFAULT 30")
         
         await db.commit()
 
@@ -366,13 +424,23 @@ async def update_account_status(account_id: int, status: str):
         )
         await db.commit()
 
-async def add_link(user_id: int, link: str):
-    """添加链接"""
+async def add_link(user_id: int, link: str) -> bool:
+    """添加链接（自动去重）"""
     async with aiosqlite.connect(DB_PATH) as db:
+        # 检查是否已存在
+        async with db.execute(
+            "SELECT id FROM links WHERE user_id = ? AND link = ?",
+            (user_id, link)
+        ) as cursor:
+            if await cursor.fetchone():
+                return False  # 已存在，跳过
+        
         await db.execute(
-            "INSERT INTO links (user_id, link) VALUES (?, ?)", (user_id, link)
+            "INSERT INTO links (user_id, link, status) VALUES (?, ?, 'pending')",
+            (user_id, link)
         )
         await db.commit()
+        return True
 
 async def get_links(user_id: int) -> List[Dict]:
     """获取用户的所有链接"""
@@ -441,9 +509,14 @@ async def get_settings(user_id: int) -> Dict:
             else:
                 # 返回默认设置
                 return {
-                    "interval_min": 30,
-                    "interval_max": 60,
-                    "daily_limit": 50
+                    "interval_min": 120,
+                    "interval_max": 180,
+                    "daily_limit": 50,
+                    "allow_repeat": 0,
+                    "sleep_after_count": 10,
+                    "sleep_duration": 30,
+                    "max_per_account": 20,
+                    "anti_flood_extra": 30
                 }
 
 async def update_settings(user_id: int, **kwargs):
@@ -453,6 +526,11 @@ async def update_settings(user_id: int, **kwargs):
         "interval_min": "UPDATE settings SET interval_min = ? WHERE user_id = ?",
         "interval_max": "UPDATE settings SET interval_max = ? WHERE user_id = ?",
         "daily_limit": "UPDATE settings SET daily_limit = ? WHERE user_id = ?",
+        "allow_repeat": "UPDATE settings SET allow_repeat = ? WHERE user_id = ?",
+        "sleep_after_count": "UPDATE settings SET sleep_after_count = ? WHERE user_id = ?",
+        "sleep_duration": "UPDATE settings SET sleep_duration = ? WHERE user_id = ?",
+        "max_per_account": "UPDATE settings SET max_per_account = ? WHERE user_id = ?",
+        "anti_flood_extra": "UPDATE settings SET anti_flood_extra = ? WHERE user_id = ?",
     }
     
     async with aiosqlite.connect(DB_PATH) as db:
@@ -467,6 +545,103 @@ async def update_settings(user_id: int, **kwargs):
                 await db.execute(allowed_queries[key], (value, user_id))
         
         await db.commit()
+
+async def get_pending_links(user_id: int) -> List[Dict]:
+    """获取待处理的链接（pending 状态）"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM links WHERE user_id = ? AND status = 'pending'", (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+async def update_link_status(link_id: int, status: str, fail_reason: str, joined_by: Optional[int]):
+    """更新链接状态"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE links SET status = ?, fail_reason = ?, joined_by = ? WHERE id = ?",
+            (status, fail_reason, joined_by, link_id)
+        )
+        await db.commit()
+
+async def check_already_joined(user_id: int, account_id: int, link: str) -> bool:
+    """检查账号是否已加入该群"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM links WHERE user_id = ? AND link = ? AND joined_by = ? AND status = 'success'",
+            (user_id, link, account_id)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+async def increment_account_join_count(account_id: int):
+    """增加账号加群计数"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE accounts 
+               SET today_joined = today_joined + 1, 
+                   total_joined = total_joined + 1,
+                   last_join_time = CURRENT_TIMESTAMP 
+               WHERE id = ?""",
+            (account_id,)
+        )
+        await db.commit()
+
+async def get_account_today_count(account_id: int) -> int:
+    """获取账号今日加群数"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT today_joined FROM accounts WHERE id = ?", (account_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def set_account_sleep(account_id: int, sleep_until: datetime):
+    """设置账号休眠"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE accounts SET sleep_until = ? WHERE id = ?",
+            (sleep_until.isoformat(), account_id)
+        )
+        await db.commit()
+
+async def get_available_account(user_id: int, max_per_account: int) -> Optional[Dict]:
+    """获取可用账号（未休眠、未达上限）"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        now = datetime.now().isoformat()
+        
+        async with db.execute(
+            """SELECT * FROM accounts 
+               WHERE user_id = ? 
+               AND (sleep_until IS NULL OR sleep_until < ?)
+               AND today_joined < ?
+               ORDER BY today_joined ASC
+               LIMIT 1""",
+            (user_id, now, max_per_account)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def get_next_wake_time(user_id: int) -> Optional[datetime]:
+    """获取下一个账号醒来的时间"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT MIN(sleep_until) FROM accounts 
+               WHERE user_id = ? AND sleep_until IS NOT NULL""",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return datetime.fromisoformat(row[0])
+            return None
+
+async def reset_daily_counters():
+    """重置每日计数器（应在每天零点调用）"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET today_joined = 0")
+        await db.commit()
+
 
 # ============== 账户管理 ==============
 
@@ -535,13 +710,13 @@ async def check_account_status(session_string: str) -> Tuple[bool, str, bool]:
 # ============== 加群核心 ==============
 
 async def join_group(client: TelegramClient, link: str) -> Tuple[bool, str]:
-    """加群核心逻辑"""
+    """加群核心逻辑 - 完善错误处理"""
     try:
         # 解析链接
         if "t.me/" in link:
             username = link.split("t.me/")[1].split("?")[0].strip("/")
         else:
-            username = link.strip()
+            username = link.strip().lstrip("@")
         
         # 尝试加入
         if username.startswith("+"):
@@ -558,16 +733,35 @@ async def join_group(client: TelegramClient, link: str) -> Tuple[bool, str]:
         return True, "加群成功"
     
     except errors.FloodWaitError as e:
-        return False, f"被限制，需等待 {e.seconds} 秒"
+        raise  # 向上抛出，由调用者处理
+    
     except errors.UserAlreadyParticipantError:
-        return False, "已经在群里"
+        return True, "已经在群里"  # 算成功
+    
     except errors.InviteHashExpiredError:
         return False, "邀请链接已过期"
+    
+    except errors.InviteHashInvalidError:
+        return False, "邀请链接无效"
+    
     except errors.ChannelPrivateError:
-        return False, "群组为私有"
+        return False, "群组为私有，无法加入"
+    
+    except errors.ChannelInvalidError:
+        return False, "群组不存在"
+    
+    except errors.UserBannedInChannelError:
+        return False, "账号被该群封禁"
+    
+    except errors.ChatWriteForbiddenError:
+        return False, "无法加入该群"
+    
     except Exception as e:
+        error_msg = str(e)
+        if "FROZEN" in error_msg:
+            raise  # 冻结错误向上抛出
         logger.error(f"加群失败: {e}")
-        return False, str(e)
+        return False, error_msg
 
 async def auto_verify(client: TelegramClient) -> bool:
     """自动过验证（简单实现）"""
@@ -608,47 +802,31 @@ async def test_proxy_connection(proxy: Dict) -> Tuple[bool, str]:
         return False, f"❌ 代理连接异常\n代理: {mask_proxy(proxy)}\n错误: {str(e)}"
 
 async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """运行加群任务"""
+    """运行加群任务 - 专业版"""
     task_running[user_id] = True
     task_paused[user_id] = False
-    
-    # 检查代理
-    proxies = load_proxies()
-    if not proxies:
-        await update.callback_query.message.edit_text(
-            "❌ 未找到可用代理\n\n"
-            "请在脚本目录创建 proxy.txt 文件并添加代理\n"
-            "支持格式：\n"
-            "• host:port\n"
-            "• host:port:user:pass\n"
-            "• user:pass@host:port\n"
-            "• socks5://host:port\n"
-            "• ABC格式: xxx.abcproxy.vip:4950:user:pass"
-        )
-        task_running[user_id] = False
-        return
-    
-    # 测试代理连通性
-    proxy_ok, proxy_msg = await test_proxy_connection(proxies[0])
-    if not proxy_ok:
-        await update.callback_query.message.edit_text(
-            f"❌ 代理连接失败\n\n{proxy_msg}\n\n请检查代理配置"
-        )
-        task_running[user_id] = False
-        return
     
     # 获取设置
     settings = await get_settings(user_id)
     interval_min = settings["interval_min"]
     interval_max = settings["interval_max"]
     daily_limit = settings["daily_limit"]
+    allow_repeat = settings.get("allow_repeat", 0)
+    sleep_after_count = settings.get("sleep_after_count", 10)
+    sleep_duration = settings.get("sleep_duration", 30)
+    max_per_account = settings.get("max_per_account", 20)
+    anti_flood_extra = settings.get("anti_flood_extra", 30)
     
-    # 获取今日已加群数量
-    success_count, failed_count = await get_today_stats(user_id)
+    # 检查代理
+    proxies = load_proxies()
+    if not proxies:
+        await update.callback_query.message.edit_text("❌ 未找到可用代理...")
+        task_running[user_id] = False
+        return
     
     # 获取账户和链接
     accounts = await get_accounts(user_id)
-    links = await get_links(user_id)
+    links = await get_pending_links(user_id)  # 只获取 pending 状态的链接
     
     if not accounts:
         await update.callback_query.message.edit_text("❌ 没有可用账户")
@@ -656,91 +834,186 @@ async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFA
         return
     
     if not links:
-        await update.callback_query.message.edit_text("❌ 没有可用链接")
+        await update.callback_query.message.edit_text("❌ 没有待加入的链接")
         task_running[user_id] = False
         return
     
+    # 统计
+    total_success = 0
+    total_failed = 0
+    invalid_links = 0
+    frozen_accounts = 0
+    
+    # 发送启动消息
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"🚀 任务启动\n账号: {len(accounts)} 个\n待加群: {len(links)} 个\n配置: 间隔{interval_min}-{interval_max}s | 休眠{sleep_after_count}个/{sleep_duration}分钟 | 单号上限{max_per_account}"
+    )
+    
     # 开始加群
-    for link_data in links:
-        if not task_running.get(user_id):
-            break
-        
+    link_index = 0
+    
+    while link_index < len(links) and task_running.get(user_id):
         # 检查暂停
         while task_paused.get(user_id):
             await asyncio.sleep(1)
         
-        # 检查每日限制
-        if success_count >= daily_limit:
+        # 检查每日上限
+        today_success, _ = await get_today_stats(user_id)
+        if today_success >= daily_limit:
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ 已达到每日上限 {daily_limit}，任务结束"
             )
             break
         
-        link = link_data["link"]
+        # 获取可用账号（未在休眠、未达上限）
+        available_account = await get_available_account(user_id, max_per_account)
         
-        # 轮换账户
-        for account in accounts:
-            if not task_running.get(user_id):
-                break
-            
-            try:
-                # 使用 helper 函数创建 client (会自动轮换代理)
-                # 获取当前将使用的代理信息
-                current_proxy = None
-                if proxy_list:
-                    current_proxy = proxy_list[(proxy_index - 1) % len(proxy_list)]
-                
-                client = get_telegram_client(account["session_string"])
-                await client.connect()
-                
-                if not await client.is_user_authorized():
-                    await update_account_status(account["id"], "unauthorized")
-                    await client.disconnect()
+        if not available_account:
+            # 所有账号都在休眠，等待
+            next_wake = await get_next_wake_time(user_id)
+            if next_wake:
+                wait_seconds = (next_wake - datetime.now()).total_seconds()
+                if wait_seconds > 0:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"😴 所有账号休眠中，等待 {int(wait_seconds/60)} 分钟..."
+                    )
+                    await asyncio.sleep(min(wait_seconds, 60))  # 每分钟检查一次
                     continue
-                
-                # 加群
-                success, message = await join_group(client, link)
-                
-                # 构建代理信息
-                proxy_info = f"\n代理: {mask_proxy(current_proxy)}" if current_proxy else ""
-                
-                if success:
-                    success_count += 1
-                    await add_stat(user_id, account["id"], link, "success", message)
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"✅ 成功: {link}\n账户: {account['phone']}{proxy_info}\n进度: {success_count}/{daily_limit}"
-                    )
-                else:
-                    failed_count += 1
-                    await add_stat(user_id, account["id"], link, "failed", message)
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"❌ 失败: {link}\n原因: {message}{proxy_info}"
-                    )
-                
+            else:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="❌ 没有可用账号（全部达到上限或休眠中）"
+                )
+                break
+        
+        link_data = links[link_index]
+        link = link_data["link"]
+        link_id = link_data["id"]
+        
+        # 检查是否重复（如果不允许重复）
+        if not allow_repeat:
+            already_joined = await check_already_joined(user_id, available_account["id"], link)
+            if already_joined:
+                link_index += 1
+                continue
+        
+        try:
+            # 创建客户端（使用代理）
+            client = get_telegram_client(available_account["session_string"], use_proxy=True)
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                await update_account_status(available_account["id"], "unauthorized")
+                await delete_account(available_account["id"])
                 await client.disconnect()
+                continue
+            
+            # 加群
+            success, message = await join_group(client, link)
+            
+            await client.disconnect()
+            
+            if success:
+                total_success += 1
+                # 更新链接状态
+                await update_link_status(link_id, "success", "", available_account["id"])
+                # 更新账号统计
+                await increment_account_join_count(available_account["id"])
                 
-                # 随机延迟
-                delay = random.randint(interval_min, interval_max)
-                await asyncio.sleep(delay)
+                # 检查是否需要休眠
+                account_today = await get_account_today_count(available_account["id"])
+                if account_today >= sleep_after_count:
+                    sleep_until = datetime.now() + timedelta(minutes=sleep_duration)
+                    await set_account_sleep(available_account["id"], sleep_until)
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"😴 账号 {available_account['phone']} 已加 {account_today} 个群，休眠 {sleep_duration} 分钟"
+                    )
                 
-                # 成功就跳到下一个链接
-                if success:
-                    break
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"✅ 成功: {link}\n账号: {available_account['phone']}\n进度: {total_success}/{daily_limit}"
+                )
+            else:
+                total_failed += 1
+                # 检查是否是无效链接
+                if "已过期" in message or "无效" in message or "私有" in message or "不存在" in message:
+                    await update_link_status(link_id, "invalid", message, None)
+                    invalid_links += 1
+                else:
+                    await update_link_status(link_id, "failed", message, None)
                 
-            except Exception as e:
-                logger.error(f"加群任务异常: {e}")
-                await add_stat(user_id, account["id"], link, "error", str(e))
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❌ 失败: {link}\n原因: {message}"
+                )
+            
+            # 随机延迟（基础 + 防风控）
+            base_delay = random.randint(interval_min, interval_max)
+            extra_delay = random.randint(0, anti_flood_extra)
+            total_delay = base_delay + extra_delay
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ 等待 {total_delay} 秒后继续..."
+            )
+            await asyncio.sleep(total_delay)
+            
+            link_index += 1
+            
+        except errors.FloodWaitError as e:
+            # 被限制，等待
+            wait_time = e.seconds
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ 被限制，等待 {wait_time} 秒..."
+            )
+            await asyncio.sleep(wait_time)
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            # 检查是否是账号问题
+            if "FROZEN" in error_msg or "frozen" in error_msg.lower():
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"❄️ 账号 {available_account['phone']} 已冻结，自动删除"
+                )
+                await delete_account(available_account["id"])
+                frozen_accounts += 1
+                continue
+            
+            if "banned" in error_msg.lower() or "deactivated" in error_msg.lower():
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"🚫 账号 {available_account['phone']} 已封禁，自动删除"
+                )
+                await delete_account(available_account["id"])
+                frozen_accounts += 1
+                continue
+            
+            # 其他错误
+            total_failed += 1
+            await update_link_status(link_id, "failed", error_msg, None)
+            link_index += 1
     
     task_running[user_id] = False
+    
+    # 构建完成消息
+    completion_msg = f"🏁 任务完成\n✅ 成功: {total_success}\n❌ 失败: {total_failed}"
+    if invalid_links > 0:
+        completion_msg += f"\n🗑️ 无效链接: {invalid_links}"
+    if frozen_accounts > 0:
+        completion_msg += f"\n❄️ 冻结账号: {frozen_accounts}"
+    
     await context.bot.send_message(
         chat_id=user_id,
-        text=f"🏁 任务完成\n成功: {success_count}\n失败: {failed_count}"
+        text=completion_msg
     )
 
-# ============== 按钮定义 ==============
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     """主菜单"""
@@ -801,8 +1074,19 @@ def get_settings_menu_keyboard() -> InlineKeyboardMarkup:
     """设置子菜单"""
     keyboard = [
         [
-            InlineKeyboardButton("⏱️ 修改间隔", callback_data="set_interval"),
-            InlineKeyboardButton("📊 修改上限", callback_data="set_limit"),
+            InlineKeyboardButton("⏱️ 加群间隔", callback_data="set_interval"),
+            InlineKeyboardButton("😴 休眠设置", callback_data="set_sleep"),
+        ],
+        [
+            InlineKeyboardButton("🔢 单号上限", callback_data="set_max_per_account"),
+            InlineKeyboardButton("📊 每日总上限", callback_data="set_daily_limit"),
+        ],
+        [
+            InlineKeyboardButton("🔄 重复加群", callback_data="toggle_repeat"),
+            InlineKeyboardButton("🛡️ 防风控延迟", callback_data="set_anti_flood"),
+        ],
+        [
+            InlineKeyboardButton("📋 查看当前配置", callback_data="show_settings"),
         ],
         [
             InlineKeyboardButton("🔙 返回主菜单", callback_data="main_menu"),
@@ -1072,6 +1356,68 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_limit":
         await query.edit_message_text(
             "请发送每日加群上限\n\n"
+            "例如: 50\n\n"
+            "发送 /cancel 取消"
+        )
+        return SET_LIMIT
+    
+    elif data == "set_sleep":
+        await query.edit_message_text(
+            "请设置休眠规则\n\n"
+            "格式: 加群数,休眠分钟\n"
+            "例如: 10,30 表示每加10个群后休眠30分钟\n\n"
+            "发送 /cancel 取消"
+        )
+        return SET_SLEEP
+    
+    elif data == "set_max_per_account":
+        await query.edit_message_text(
+            "请发送单号每日最大加群数\n\n"
+            "例如: 20\n\n"
+            "发送 /cancel 取消"
+        )
+        return SET_MAX_PER_ACCOUNT
+    
+    elif data == "toggle_repeat":
+        settings = await get_settings(user_id)
+        current = settings.get("allow_repeat", 0)
+        new_value = 1 if current == 0 else 0
+        await update_settings(user_id, allow_repeat=new_value)
+        status = "开启" if new_value == 1 else "关闭"
+        await query.edit_message_text(
+            f"✅ 重复加群已{status}",
+            reply_markup=get_settings_menu_keyboard()
+        )
+    
+    elif data == "set_anti_flood":
+        await query.edit_message_text(
+            "请发送防风控额外延迟（秒）\n\n"
+            "这将在基础延迟之上随机增加0到指定秒数的延迟\n"
+            "例如: 30\n\n"
+            "发送 /cancel 取消"
+        )
+        return SET_ANTI_FLOOD
+    
+    elif data == "show_settings":
+        settings = await get_settings(user_id)
+        repeat_status = "开启" if settings.get("allow_repeat", 0) == 1 else "关闭"
+        text = (
+            f"⚙️ 当前配置\n\n"
+            f"⏱️ 加群间隔: {settings['interval_min']}-{settings['interval_max']} 秒\n"
+            f"😴 休眠设置: 每加 {settings.get('sleep_after_count', 10)} 个群后休眠 {settings.get('sleep_duration', 30)} 分钟\n"
+            f"🔢 单号每日上限: {settings.get('max_per_account', 20)} 个\n"
+            f"📊 每日总上限: {settings['daily_limit']} 个\n"
+            f"🔄 重复加群: {repeat_status}\n"
+            f"🛡️ 防风控延迟: 0-{settings.get('anti_flood_extra', 30)} 秒随机"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=get_settings_menu_keyboard()
+        )
+    
+    elif data == "set_daily_limit":
+        await query.edit_message_text(
+            "请发送每日总加群上限\n\n"
             "例如: 50\n\n"
             "发送 /cancel 取消"
         )
@@ -1515,11 +1861,17 @@ async def handle_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # 简单验证
     if "t.me/" in link or link.startswith("@") or link.startswith("+"):
-        await add_link(user_id, link)
-        await update.message.reply_text(
-            f"✅ 链接已添加\n{link}",
-            reply_markup=get_links_menu_keyboard()
-        )
+        added = await add_link(user_id, link)
+        if added:
+            await update.message.reply_text(
+                f"✅ 链接已添加\n{link}",
+                reply_markup=get_links_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ 链接已存在，已跳过\n{link}",
+                reply_markup=get_links_menu_keyboard()
+            )
     else:
         await update.message.reply_text(
             "❌ 链接格式不正确",
@@ -1546,14 +1898,22 @@ async def handle_upload_txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines = f.readlines()
             
             count = 0
+            skipped = 0
             for line in lines:
                 link = line.strip()
                 if link and ("t.me/" in link or link.startswith("@") or link.startswith("+")):
-                    await add_link(user_id, link)
-                    count += 1
+                    added = await add_link(user_id, link)
+                    if added:
+                        count += 1
+                    else:
+                        skipped += 1
+            
+            msg = f"✅ 成功添加 {count} 个链接"
+            if skipped > 0:
+                msg += f"\n⚠️ 跳过 {skipped} 个重复链接"
             
             await update.message.reply_text(
-                f"✅ 成功添加 {count} 个链接",
+                msg,
                 reply_markup=get_links_menu_keyboard()
             )
         except Exception as e:
@@ -1630,6 +1990,89 @@ async def handle_set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
+async def handle_set_sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理设置休眠"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    # 解析格式: 10,30
+    match = re.match(r"(\d+),(\d+)", text)
+    if match:
+        count = int(match.group(1))
+        duration = int(match.group(2))
+        
+        if count > 0 and duration > 0:
+            await update_settings(user_id, sleep_after_count=count, sleep_duration=duration)
+            await update.message.reply_text(
+                f"✅ 休眠设置已更新\n每加 {count} 个群后休眠 {duration} 分钟",
+                reply_markup=get_settings_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "❌ 数值必须大于0",
+                reply_markup=get_settings_menu_keyboard()
+            )
+    else:
+        await update.message.reply_text(
+            "❌ 格式错误，请使用: 加群数,休眠分钟\n例如: 10,30",
+            reply_markup=get_settings_menu_keyboard()
+        )
+    
+    return ConversationHandler.END
+
+async def handle_set_max_per_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理设置单号上限"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    try:
+        limit = int(text)
+        if limit > 0:
+            await update_settings(user_id, max_per_account=limit)
+            await update.message.reply_text(
+                f"✅ 单号每日上限已设置为 {limit}",
+                reply_markup=get_settings_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "❌ 上限必须大于0",
+                reply_markup=get_settings_menu_keyboard()
+            )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ 请输入有效的数字",
+            reply_markup=get_settings_menu_keyboard()
+        )
+    
+    return ConversationHandler.END
+
+async def handle_set_anti_flood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理设置防风控延迟"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    try:
+        delay = int(text)
+        if delay >= 0:
+            await update_settings(user_id, anti_flood_extra=delay)
+            await update.message.reply_text(
+                f"✅ 防风控延迟已设置为 0-{delay} 秒随机",
+                reply_markup=get_settings_menu_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                "❌ 延迟不能小于0",
+                reply_markup=get_settings_menu_keyboard()
+            )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ 请输入有效的数字",
+            reply_markup=get_settings_menu_keyboard()
+        )
+    
+    return ConversationHandler.END
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """取消操作"""
     await update.message.reply_text(
@@ -1671,6 +2114,15 @@ def main():
             ],
             SET_LIMIT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_limit)
+            ],
+            SET_SLEEP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_sleep)
+            ],
+            SET_MAX_PER_ACCOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_max_per_account)
+            ],
+            SET_ANTI_FLOOD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_set_anti_flood)
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

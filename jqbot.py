@@ -32,6 +32,7 @@ from telegram.ext import (
 from telethon import TelegramClient, functions, errors
 from telethon.sessions import StringSession
 import aiosqlite
+import socks
 
 # ============== 配置 ==============
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -44,6 +45,7 @@ MAX_ZIP_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 DB_PATH = "jqbot.db"
 SESSIONS_DIR = "sessions"
 LOGS_DIR = "logs"
+PROXY_FILE = "proxy.txt"
 
 # 创建必要的目录
 os.makedirs(SESSIONS_DIR, exist_ok=True)
@@ -72,6 +74,211 @@ logger = logging.getLogger(__name__)
 # 任务状态
 task_running = {}
 task_paused = {}
+
+# 代理管理
+proxy_list = []
+proxy_index = 0
+
+# ============== 代理管理 ==============
+
+def parse_proxy_line(line: str) -> Optional[Dict]:
+    """解析单行代理，支持多种格式"""
+    line = line.strip()
+    
+    # 跳过空行和注释
+    if not line or line.startswith('#'):
+        return None
+    
+    try:
+        proxy_type = socks.SOCKS5  # 默认 SOCKS5
+        host = None
+        port = None
+        username = None
+        password = None
+        
+        # 1. 带协议前缀的格式: socks5://host:port 或 socks5://user:pass@host:port
+        if '://' in line:
+            protocol, rest = line.split('://', 1)
+            protocol = protocol.lower()
+            
+            if protocol == 'socks5':
+                proxy_type = socks.SOCKS5
+            elif protocol == 'socks4':
+                proxy_type = socks.SOCKS4
+            elif protocol == 'http':
+                proxy_type = socks.HTTP
+            else:
+                logger.warning(f"不支持的协议: {protocol}")
+                return None
+            
+            # 检查是否有认证信息
+            if '@' in rest:
+                auth, addr = rest.rsplit('@', 1)
+                if ':' in auth:
+                    username, password = auth.split(':', 1)
+                if ':' in addr:
+                    host, port = addr.rsplit(':', 1)
+            else:
+                if ':' in rest:
+                    host, port = rest.rsplit(':', 1)
+        
+        # 2. username:password@host:port 格式 (必须在 ABC 格式之前检查)
+        elif '@' in line:
+            auth, addr = line.rsplit('@', 1)
+            if ':' in auth:
+                username, password = auth.split(':', 1)
+            if ':' in addr:
+                host, port = addr.rsplit(':', 1)
+        
+        # 3. host:port:username:password 格式 (ABC代理格式)
+        elif line.count(':') == 3:
+            parts = line.split(':', 3)
+            host, port, username, password = parts
+        
+        # 4. 基础格式: host:port
+        elif ':' in line:
+            host, port = line.rsplit(':', 1)
+        
+        else:
+            logger.warning(f"无法解析代理格式: {line}")
+            return None
+        
+        # 验证必需字段
+        if not host or not port:
+            logger.warning(f"代理缺少必需字段: {line}")
+            return None
+        
+        # 转换端口为整数
+        try:
+            port = int(port)
+        except ValueError:
+            logger.warning(f"无效的端口号: {port}")
+            return None
+        
+        return {
+            'type': proxy_type,
+            'host': host,
+            'port': port,
+            'username': username,
+            'password': password,
+            'raw': line
+        }
+    
+    except Exception as e:
+        logger.warning(f"解析代理失败: {line}, 错误: {e}")
+        return None
+
+
+def load_proxies() -> List[Dict]:
+    """从 proxy.txt 加载代理列表"""
+    global proxy_list
+    proxy_list = []
+    
+    if not os.path.exists(PROXY_FILE):
+        logger.warning(f"代理文件不存在: {PROXY_FILE}")
+        return proxy_list
+    
+    try:
+        with open(PROXY_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        for line in lines:
+            proxy = parse_proxy_line(line)
+            if proxy:
+                proxy_list.append(proxy)
+        
+        logger.info(f"成功加载 {len(proxy_list)} 个代理")
+    except Exception as e:
+        logger.error(f"加载代理文件失败: {e}")
+    
+    return proxy_list
+
+
+def get_proxy_for_telethon(proxy: Dict) -> Tuple:
+    """转换为 Telethon 需要的 tuple 格式"""
+    if proxy['username'] and proxy['password']:
+        return (
+            proxy['type'],
+            proxy['host'],
+            proxy['port'],
+            True,  # rdns
+            proxy['username'],
+            proxy['password']
+        )
+    else:
+        return (
+            proxy['type'],
+            proxy['host'],
+            proxy['port']
+        )
+
+
+def get_next_proxy() -> Optional[Dict]:
+    """获取下一个代理（轮换使用）"""
+    global proxy_index
+    
+    if not proxy_list:
+        return None
+    
+    proxy = proxy_list[proxy_index]
+    proxy_index = (proxy_index + 1) % len(proxy_list)
+    
+    return proxy
+
+
+def reload_proxies() -> int:
+    """重新加载代理列表"""
+    global proxy_index
+    proxy_index = 0
+    proxies = load_proxies()
+    return len(proxies)
+
+
+def mask_proxy(proxy: Dict) -> str:
+    """脱敏显示代理信息"""
+    host = proxy['host']
+    port = proxy['port']
+    
+    if proxy['username']:
+        # 隐藏部分密码
+        username = proxy['username']
+        password = proxy['password']
+        if len(password) > 4:
+            masked_pass = password[:2] + '*' * (len(password) - 4) + password[-2:]
+        else:
+            masked_pass = '***'
+        return f"{host}:{port} (用户: {username}, 密码: {masked_pass})"
+    else:
+        return f"{host}:{port}"
+
+
+async def test_proxy(proxy: Dict) -> Tuple[bool, str]:
+    """测试单个代理连通性"""
+    try:
+        proxy_tuple = get_proxy_for_telethon(proxy)
+        
+        # 创建临时 client 测试连接
+        client = TelegramClient(
+            StringSession(),
+            API_ID,
+            API_HASH,
+            proxy=proxy_tuple
+        )
+        
+        # 尝试连接
+        await client.connect()
+        connected = client.is_connected()
+        await client.disconnect()
+        
+        if connected:
+            return True, f"代理连接成功: {mask_proxy(proxy)}"
+        else:
+            return False, f"代理连接失败: {mask_proxy(proxy)}"
+    
+    except Exception as e:
+        logger.error(f"测试代理失败: {e}")
+        return False, f"代理测试异常: {mask_proxy(proxy)} - {str(e)}"
+
 
 # ============== 数据库 ==============
 
@@ -278,15 +485,24 @@ def clean_phone_number(phone: str) -> str:
     return phone.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '')
 
 
-def get_telegram_client(session_string: str) -> TelegramClient:
+def get_telegram_client(session_string: str, use_proxy: bool = True) -> TelegramClient:
     """根据 session 类型创建 TelegramClient"""
+    proxy_tuple = None
+    
+    # 如果启用代理，获取下一个代理
+    if use_proxy:
+        proxy = get_next_proxy()
+        if proxy:
+            proxy_tuple = get_proxy_for_telethon(proxy)
+            logger.info(f"使用代理: {mask_proxy(proxy)}")
+    
     if is_session_file_path(session_string):
         # 文件路径
         session = session_string if not session_string.endswith('.session') else session_string.replace('.session', '')
-        return TelegramClient(session, API_ID, API_HASH)
+        return TelegramClient(session, API_ID, API_HASH, proxy=proxy_tuple)
     else:
         # StringSession
-        return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        return TelegramClient(StringSession(session_string), API_ID, API_HASH, proxy=proxy_tuple)
 
 
 async def check_account_status(session_string: str) -> Tuple[bool, str]:
@@ -354,10 +570,62 @@ async def auto_verify(client: TelegramClient) -> bool:
         logger.error(f"自动验证失败: {e}")
         return False
 
+async def test_proxy_connection(proxy: Dict) -> Tuple[bool, str]:
+    """测试代理连通性"""
+    try:
+        proxy_tuple = get_proxy_for_telethon(proxy)
+        
+        # 使用代理创建临时 client 测试连接
+        client = TelegramClient(
+            StringSession(),
+            API_ID,
+            API_HASH,
+            proxy=proxy_tuple
+        )
+        
+        # 尝试连接
+        await client.connect()
+        connected = client.is_connected()
+        await client.disconnect()
+        
+        if connected:
+            return True, f"✅ 代理连接成功\n代理: {mask_proxy(proxy)}"
+        else:
+            return False, f"❌ 代理连接失败\n代理: {mask_proxy(proxy)}"
+    
+    except Exception as e:
+        logger.error(f"测试代理连接失败: {e}")
+        return False, f"❌ 代理连接异常\n代理: {mask_proxy(proxy)}\n错误: {str(e)}"
+
 async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """运行加群任务"""
     task_running[user_id] = True
     task_paused[user_id] = False
+    
+    # 检查代理
+    proxies = load_proxies()
+    if not proxies:
+        await update.callback_query.message.edit_text(
+            "❌ 未找到可用代理\n\n"
+            "请在脚本目录创建 proxy.txt 文件并添加代理\n"
+            "支持格式：\n"
+            "• host:port\n"
+            "• host:port:user:pass\n"
+            "• user:pass@host:port\n"
+            "• socks5://host:port\n"
+            "• ABC格式: xxx.abcproxy.vip:4950:user:pass"
+        )
+        task_running[user_id] = False
+        return
+    
+    # 测试代理连通性
+    proxy_ok, proxy_msg = await test_proxy_connection(proxies[0])
+    if not proxy_ok:
+        await update.callback_query.message.edit_text(
+            f"❌ 代理连接失败\n\n{proxy_msg}\n\n请检查代理配置"
+        )
+        task_running[user_id] = False
+        return
     
     # 获取设置
     settings = await get_settings(user_id)
@@ -407,7 +675,12 @@ async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFA
                 break
             
             try:
-                # 使用 helper 函数创建 client
+                # 使用 helper 函数创建 client (会自动轮换代理)
+                # 获取当前将使用的代理信息
+                current_proxy = None
+                if proxy_list:
+                    current_proxy = proxy_list[(proxy_index - 1) % len(proxy_list)]
+                
                 client = get_telegram_client(account["session_string"])
                 await client.connect()
                 
@@ -419,19 +692,22 @@ async def run_join_task(user_id: int, update: Update, context: ContextTypes.DEFA
                 # 加群
                 success, message = await join_group(client, link)
                 
+                # 构建代理信息
+                proxy_info = f"\n代理: {mask_proxy(current_proxy)}" if current_proxy else ""
+                
                 if success:
                     success_count += 1
                     await add_stat(user_id, account["id"], link, "success", message)
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"✅ 成功: {link}\n账户: {account['phone']}\n进度: {success_count}/{daily_limit}"
+                        text=f"✅ 成功: {link}\n账户: {account['phone']}{proxy_info}\n进度: {success_count}/{daily_limit}"
                     )
                 else:
                     failed_count += 1
                     await add_stat(user_id, account["id"], link, "failed", message)
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"❌ 失败: {link}\n原因: {message}"
+                        text=f"❌ 失败: {link}\n原因: {message}{proxy_info}"
                     )
                 
                 await client.disconnect()
@@ -466,6 +742,9 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⚙️ 加群设置", callback_data="menu_settings"),
             InlineKeyboardButton("🚀 开始任务", callback_data="start_task"),
+        ],
+        [
+            InlineKeyboardButton("🌐 代理管理", callback_data="menu_proxy"),
         ],
         [
             InlineKeyboardButton("📊 统计面板", callback_data="show_stats"),
@@ -514,6 +793,22 @@ def get_settings_menu_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("⏱️ 修改间隔", callback_data="set_interval"),
             InlineKeyboardButton("📊 修改上限", callback_data="set_limit"),
+        ],
+        [
+            InlineKeyboardButton("🔙 返回主菜单", callback_data="main_menu"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_proxy_menu_keyboard() -> InlineKeyboardMarkup:
+    """代理管理子菜单"""
+    keyboard = [
+        [
+            InlineKeyboardButton("📋 代理列表", callback_data="list_proxies"),
+            InlineKeyboardButton("🔄 重载代理", callback_data="reload_proxies"),
+        ],
+        [
+            InlineKeyboardButton("🧪 测试代理", callback_data="test_proxy"),
         ],
         [
             InlineKeyboardButton("🔙 返回主菜单", callback_data="main_menu"),
@@ -753,6 +1048,60 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "发送 /cancel 取消"
         )
         return SET_LIMIT
+    
+    # 代理管理
+    elif data == "menu_proxy":
+        proxies = load_proxies()
+        text = (
+            f"🌐 代理管理\n\n"
+            f"已加载代理: {len(proxies)} 个"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=get_proxy_menu_keyboard()
+        )
+    
+    elif data == "list_proxies":
+        proxies = load_proxies()
+        if not proxies:
+            text = "📋 代理列表\n\n暂无代理\n\n请在脚本目录创建 proxy.txt 文件"
+        else:
+            text = f"📋 代理列表 (共 {len(proxies)} 个)\n\n"
+            for idx, proxy in enumerate(proxies[:10], 1):
+                text += f"{idx}. {mask_proxy(proxy)}\n"
+            
+            if len(proxies) > 10:
+                text += f"\n... 还有 {len(proxies) - 10} 个代理"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=get_proxy_menu_keyboard()
+        )
+    
+    elif data == "reload_proxies":
+        count = reload_proxies()
+        await query.edit_message_text(
+            f"🔄 已重新加载 {count} 个代理",
+            reply_markup=get_proxy_menu_keyboard()
+        )
+    
+    elif data == "test_proxy":
+        proxies = load_proxies()
+        if not proxies:
+            await query.edit_message_text(
+                "❌ 暂无代理可测试\n\n请先添加代理到 proxy.txt",
+                reply_markup=get_proxy_menu_keyboard()
+            )
+        else:
+            await query.edit_message_text("🧪 正在测试第一个代理...")
+            
+            success, message = await test_proxy(proxies[0])
+            
+            status_icon = "✅" if success else "❌"
+            await query.edit_message_text(
+                f"{status_icon} 测试结果\n\n{message}",
+                reply_markup=get_proxy_menu_keyboard()
+            )
     
     # 任务控制
     elif data == "start_task":

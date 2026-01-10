@@ -37,6 +37,9 @@ sessions/
 logs/
 *.log
 
+# Proxy configuration
+proxy.txt
+
 # Temporary files
 /tmp/
 *.tmp

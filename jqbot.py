@@ -1260,7 +1260,7 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
                 if phones:
                     text += "\n\n已添加账号:"
                     for phone in phones[:10]:  # 最多显示10个
-                        text += f"\n• +{phone}"
+                        text += f"\n• {phone}"
                     if len(phones) > 10:
                         text += f"\n... 还有 {len(phones) - 10} 个"
                 

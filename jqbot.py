@@ -505,8 +505,11 @@ def get_telegram_client(session_string: str, use_proxy: bool = True) -> Telegram
         return TelegramClient(StringSession(session_string), API_ID, API_HASH, proxy=proxy_tuple)
 
 
-async def check_account_status(session_string: str) -> Tuple[bool, str]:
-    """检查账户状态 - 支持 StringSession 或文件路径"""
+async def check_account_status(session_string: str) -> Tuple[bool, str, bool]:
+    """
+    检查账户状态
+    返回: (是否在线, 状态信息, 是否被封禁)
+    """
     try:
         client = get_telegram_client(session_string)
         await client.connect()
@@ -514,13 +517,20 @@ async def check_account_status(session_string: str) -> Tuple[bool, str]:
         if await client.is_user_authorized():
             me = await client.get_me()
             await client.disconnect()
-            return True, f"online - {me.phone}"
+            return True, f"online - {me.phone}", False
         else:
             await client.disconnect()
-            return False, "未授权"
+            return False, "未授权", False
+            
+    except errors.UserDeactivatedBanError:
+        return False, "账户已被封禁", True
+    except errors.UserDeactivatedError:
+        return False, "账户已被删除", True
+    except errors.AuthKeyUnregisteredError:
+        return False, "Session已失效", True
     except Exception as e:
         logger.error(f"检查账户状态失败: {e}")
-        return False, str(e)
+        return False, str(e), False
 
 # ============== 加群核心 ==============
 
@@ -945,15 +955,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("🔄 正在刷新状态...")
             
+            removed_count = 0
             for acc in accounts:
-                is_online, status = await check_account_status(acc["session_string"])
-                await update_account_status(
-                    acc["id"],
-                    "online" if is_online else "offline"
-                )
+                is_online, status, is_banned = await check_account_status(acc["session_string"])
+                
+                if is_banned:
+                    # 自动删除封禁账户
+                    await delete_account(acc["id"])
+                    # 删除 session 文件
+                    if is_session_file_path(acc["session_string"]):
+                        session_path = acc["session_string"]
+                        if not session_path.endswith('.session'):
+                            session_path += '.session'
+                        if os.path.exists(session_path):
+                            os.remove(session_path)
+                    removed_count += 1
+                else:
+                    await update_account_status(
+                        acc["id"],
+                        "online" if is_online else "offline"
+                    )
+            
+            msg = "✅ 状态已刷新"
+            if removed_count > 0:
+                msg += f"\n🗑️ 已自动删除 {removed_count} 个封禁/无效账户"
             
             await query.edit_message_text(
-                "✅ 状态已刷新",
+                msg,
                 reply_markup=get_accounts_menu_keyboard()
             )
     
@@ -1226,15 +1254,24 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
             
             if file_name.endswith(".zip"):
                 # 处理 ZIP 文件
-                success, message, phone = await process_zip_account(temp_path, user_id)
+                success, message, phones = await process_zip_account(temp_path, user_id)
+                
+                text = message
+                if phones:
+                    text += "\n\n已添加账号:"
+                    for phone in phones[:10]:  # 最多显示10个
+                        text += f"\n• {phone}"
+                    if len(phones) > 10:
+                        text += f"\n... 还有 {len(phones) - 10} 个"
+                
                 if success:
                     await update.message.reply_text(
-                        f"✅ 账户添加成功\n{message}",
+                        text,
                         reply_markup=get_accounts_menu_keyboard()
                     )
                 else:
                     await update.message.reply_text(
-                        f"❌ {message}",
+                        f"❌ {text}",
                         reply_markup=get_accounts_menu_keyboard()
                     )
             
@@ -1305,7 +1342,7 @@ async def handle_upload_account(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str, str]:
-    """处理单个 session 文件"""
+    """处理单个 session 文件，自动检测封禁状态"""
     dest_path = None
     try:
         # 使用 Telethon 加载 session 文件
@@ -1341,6 +1378,22 @@ async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str,
                 os.remove(dest_path)
             return False, "Session 文件未授权或已过期", ""
     
+    except errors.UserDeactivatedBanError:
+        # 清理文件，不保存
+        if dest_path and os.path.exists(dest_path):
+            os.remove(dest_path)
+        return False, "账户已被封禁 (banned)", ""
+    
+    except errors.UserDeactivatedError:
+        if dest_path and os.path.exists(dest_path):
+            os.remove(dest_path)
+        return False, "账户已被删除", ""
+    
+    except errors.AuthKeyUnregisteredError:
+        if dest_path and os.path.exists(dest_path):
+            os.remove(dest_path)
+        return False, "Session已失效", ""
+    
     except Exception as e:
         logger.error(f"处理 session 文件失败: {e}")
         # 清理失败的文件
@@ -1352,8 +1405,8 @@ async def process_session_file(file_path: str, user_id: int) -> Tuple[bool, str,
         return False, "Session 文件处理失败", ""
 
 
-async def process_zip_account(zip_path: str, user_id: int) -> Tuple[bool, str, str]:
-    """处理 ZIP 文件 - 支持 session、tdata 格式"""
+async def process_zip_account(zip_path: str, user_id: int) -> Tuple[bool, str, List[str]]:
+    """处理 ZIP 文件 - 支持批量导入多个 session 文件"""
     with tempfile.TemporaryDirectory() as extract_dir:
         try:
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -1361,41 +1414,54 @@ async def process_zip_account(zip_path: str, user_id: int) -> Tuple[bool, str, s
                 for member in zip_ref.namelist():
                     # Check for path traversal
                     if member.startswith('/') or '..' in member:
-                        return False, "ZIP 文件包含不安全的路径", ""
+                        return False, "ZIP 文件包含不安全的路径", []
                     # Check file size (prevent zip bomb)
                     info = zip_ref.getinfo(member)
                     if info.file_size > MAX_ZIP_FILE_SIZE:
-                        return False, "ZIP 文件内容过大", ""
+                        return False, "ZIP 文件内容过大", []
                 
                 zip_ref.extractall(extract_dir)
         except (zipfile.BadZipFile, ValueError) as e:
             logger.warning(f"无效的 zip 文件: {e}")
-            return False, "ZIP 文件格式不正确", ""
+            return False, "ZIP 文件格式不正确", []
         
         # 检查是否是 tdata 格式
         tdata_result = await process_tdata_format(extract_dir, user_id)
         if tdata_result[0]:
-            return tdata_result
+            # tdata format returns Tuple[bool, str, str], we need to convert to Tuple[bool, str, List[str]]
+            return tdata_result[0], tdata_result[1], [tdata_result[2]] if tdata_result[2] else []
         
         # 检查是否有 session 文件
         session_files = []
-        json_files = []
         
         for root, dirs, files in os.walk(extract_dir):
             for file in files:
                 if file.endswith('.session'):
                     session_files.append(os.path.join(root, file))
-                elif file.endswith('.json'):
-                    json_files.append(os.path.join(root, file))
         
-        if session_files:
-            # 处理第一个找到的 session 文件
-            result = await process_session_file(session_files[0], user_id)
-            if result[0]:
-                return result
-            return False, "Session 文件无效", ""
+        if not session_files:
+            return False, "ZIP 文件中未找到有效的 session 或 tdata 文件", []
         
-        return False, "ZIP 文件中未找到有效的 session 或 tdata 文件", ""
+        # 批量处理所有 session 文件
+        success_list = []
+        failed_list = []
+        banned_list = []
+        
+        for session_file in session_files:
+            result = await process_session_file(session_file, user_id)
+            if result[0]:  # 成功
+                success_list.append(result[2])  # phone
+            elif "banned" in result[1].lower() or "禁" in result[1] or "封" in result[1]:
+                banned_list.append((os.path.basename(session_file), result[1]))
+            else:
+                failed_list.append((os.path.basename(session_file), result[1]))
+        
+        # 返回统计信息
+        message = f"✅ 批量导入完成\n成功: {len(success_list)} 个\n失败: {len(failed_list)} 个"
+        if banned_list:
+            message += f"\n封禁/冻结: {len(banned_list)} 个（已跳过）"
+        
+        return len(success_list) > 0, message, success_list
 
 
 async def process_tdata_format(extract_dir: str, user_id: int) -> Tuple[bool, str, str]:
